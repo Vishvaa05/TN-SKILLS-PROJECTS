@@ -1,0 +1,234 @@
+import os
+
+# Define the folder structure
+directories = [
+    "comiccraft/app",
+    "comiccraft/templates",
+    "comiccraft/static/panels",
+    "comiccraft/static/exports",
+    "comiccraft/static/fonts"
+]
+
+# Define the file contents
+files = {
+    "comiccraft/requirements.txt": "fastapi\nuvicorn\njinja2\npython-multipart\ngoogle-generativeai\ndiffusers\ntransformers\nfpdf\nPillow\naccelerate\n",
+    "comiccraft/.env": "GEMINI_API_KEY=your_gemini_api_key_here\nHF_API_KEY=your-huggingface-api-key-here\n",
+    "comiccraft/app/gemini_flash.py": '''import json
+
+def generate_outline(user_prompt: str) -> list:
+    prompt = f"""
+You are a professional AI comic planner.
+Your task is to generate a *strictly formatted* JSON array containing 5 panel descriptions for a comic based on the story idea below:
+STORY: "{user_prompt}"
+
+Each JSON object must include:
+- "panel" (integer)
+- "title" (string)
+- "scene_description" (string)
+- "image_prompt" (string)
+
+Respond ONLY in this valid JSON format, without any explanations or markdown:
+[
+  {{
+    "panel": 1,
+    "title": "Title here",
+    "scene_description": "Scene description here",
+    "image_prompt": "Image prompt for Stable Diffusion"
+  }}
+]
+"""
+    try:
+        response = model.generate_content(prompt)
+        output_text = response.text.strip()
+        
+        if output_text.startswith("```json"):
+            output_text = output_text.replace("```json", "").replace("```", "").strip()
+            
+        panel_data = json.loads(output_text)
+        
+        if not isinstance(panel_data, list):
+            raise ValueError("Gemini response is not a list.")
+            
+        for panel in panel_data:
+            if not isinstance(panel, dict) or not all(key in panel for key in ("panel", "title", "scene_description", "image_prompt")):
+                raise ValueError(f"Invalid panel format or missing keys: {panel}")
+                
+        return panel_data
+        
+    except json.JSONDecodeError as e:
+        return [{"error": f"JSON parsing failed: {str(e)}"}]
+    except Exception as e:
+        return [{"error": f"Generation failed: {str(e)}"}]
+''',
+
+    "comiccraft/app/gemini_pro.py": '''def generate_story(outline: list) -> str:
+    formatted_outline = "\\n".join([f"{i+1}. {item}" for i, item in enumerate(outline)])
+    
+    prompt = f"""
+You're a comic book writer.
+Given the following panel breakdown, write a comic-style story with engaging narration and character dialogues for each panel.
+
+Panel Outline:
+{formatted_outline}
+
+Guidelines:
+- Use a fun and engaging tone, like an actual comic book.
+- Include narration and clearly marked character lines.
+- Keep each panel self-contained but part of a cohesive story.
+"""
+    try:
+        response = model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        return f"Error generating story: {str(e)}"
+''',
+
+    "comiccraft/app/image_generator.py": '''import os
+
+def generate_image(prompt, filename=None):
+    if not filename:
+        filename = sanitize_filename(prompt)
+        
+    image = pipe(prompt).images[0]
+    path = f"static/panels/{filename}"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    image.save(path)
+    return path
+''',
+
+    "comiccraft/app/layout_builder.py": '''def build_comic_layout(image_paths, full_story, outline):
+    story_panels = full_story.split("**Panel")
+    story_panels = [f"**Panel{panel}" for panel in story_panels if panel.strip()]
+    
+    layout = []
+    for idx, (image, text, panel_info) in enumerate(zip(image_paths, story_panels, outline), start=1):
+        layout.append({
+            "panel": idx,
+            "title": panel_info.get("title", f"Panel {idx}"),
+            "image_path": image,
+            "text": "\\n".join(text.strip().splitlines()[1:]).strip(),
+            "scene_description": panel_info.get("scene_description", "")
+        })
+        
+    return layout
+''',
+
+    "comiccraft/app/exporters.py": '''import os
+from fpdf import FPDF
+from datetime import datetime
+
+def save_pdf(layout):
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    
+    pdf.add_font('DejaVu', '', FONT_PATH, uni=True)
+    pdf.set_font('DejaVu', '', 12)
+    
+    for panel in layout:
+        image_path = panel['image_path']
+        story_text = panel['text']
+        
+        pdf.add_page()
+        
+        pdf.set_font('DejaVu', '', 14)
+        pdf.cell(0, 10, f"Panel {panel['panel']}", ln=True, align="C")
+        pdf.set_font('DejaVu', '', 12)
+        
+        y_image = 30
+        image_height = 100
+        spacing_after_image = 15
+        
+        if os.path.exists(image_path):
+            pdf.image(image_path, x=10, y=y_image, w=pdf.w - 20, h=image_height)
+        else:
+            pdf.set_y(y_image)
+            pdf.multi_cell(0, 10, f"Image missing: {image_path}")
+            
+        pdf.set_y(y_image + image_height + spacing_after_image)
+        story_lines = story_text.strip().splitlines()
+        if story_lines and story_lines[0].strip().lower().startswith("**panel"):
+            story_lines = story_lines[1:]
+        cleaned_text = "\\n".join(story_lines).strip()
+        pdf.multi_cell(0, 10, cleaned_text)
+        
+    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    filename = f"comic_{timestamp}.pdf"
+    pdf_path = os.path.join(EXPORT_FOLDER, filename)
+    pdf.output(pdf_path)
+    
+    return pdf_path
+''',
+
+    "comiccraft/app/routes.py": '''from fastapi import APIRouter, Request, Form, HTTPException
+from fastapi.responses import HTMLResponse
+import traceback
+
+router = APIRouter()
+
+@router.post("/generate", response_class=HTMLResponse)
+async def generate_comic(
+    request: Request,
+    prompt: str = Form(...),
+    character_name: str = Form(...),
+    setting: str = Form(...),
+    tone: str = Form(...),
+    style: str = Form(...)
+):
+    try:
+        full_prompt = (
+            f"{prompt}\\n"
+            f"The main character is {character_name}. "
+            f"The setting is a {setting}. "
+            f"The tone is {tone}. The art style is {style}."
+        )
+        
+        outline = generate_outline(full_prompt)
+        if not isinstance(outline, list) or not all("image_prompt" in panel for panel in outline):
+            raise ValueError("Invalid outline structure from Gemini response.")
+            
+        full_story = generate_story(outline)
+        images = [generate_image(panel["image_prompt"]) for panel in outline]
+        layout = build_comic_layout(images, full_story, outline)
+        
+        pdf_path = save_pdf(layout)
+        web_pdf_path = "/" + pdf_path.replace("\\\\", "/")
+        
+        return templates.TemplateResponse("comic_preview.html", {
+            "request": request,
+            "layout": layout,
+            "pdf_path": web_pdf_path
+        })
+        
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/export-success", response_class=HTMLResponse)
+async def export_success(request: Request, pdf_path: str):
+    return templates.TemplateResponse("export_success.html", {
+        "request": request,
+        "pdf_path": pdf_path
+    })
+
+@router.get("/test-image")
+async def test_image(prompt: str = "A futuristic city at sunset, sci-fi, cinematic, artstation"):
+    try:
+        image_path = generate_image(prompt)
+        return {"message": "Image generated successfully", "path": image_path}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+'''
+}
+
+# Create directories
+for directory in directories:
+    os.makedirs(directory, exist_ok=True)
+    print(f"Created directory: {directory}")
+
+# Create and write files
+for filepath, content in files.items():
+    with open(filepath, "w", encoding="utf-8") as file:
+        file.write(content)
+    print(f"Created file: {filepath}")
+
+print("\\nSuccessfully generated the ComicCraft project folder!")
